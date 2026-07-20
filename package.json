@@ -1,7 +1,7 @@
 {
   "name": "opencode-auto-mode",
   "version": "0.1.0",
-  "description": "Fail-closed automatic LLM review for OpenCode tool permissions.",
+  "description": "Automatic permission classifier for OpenCode with Claude Code- and Codex-style auto mode.",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {

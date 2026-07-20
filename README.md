@@ -1,8 +1,8 @@
 # OpenCode Auto Mode
 
-`opencode-auto-mode` is an OpenCode plugin that automatically reviews tool invocations before they execute. It provides a workflow similar to Codex Auto-review and Claude Code auto mode without requiring the user to approve every permission prompt manually.
+`opencode-auto-mode` is an automatic permission classifier for OpenCode that brings Claude Code- and Codex-style auto mode to tool execution without requiring the user to approve every permission prompt manually.
 
-The plugin is fail-closed. If an LLM review is required and the configured reviewer model is missing, unavailable, times out, or returns an invalid decision, the command is blocked.
+For operations that require LLM classification, the plugin is fail-closed. If no reviewer model can be resolved, the selected model is unavailable, the review times out, or the model returns an invalid decision, the operation is blocked.
 
 ## Features
 
@@ -18,6 +18,7 @@ The plugin is fail-closed. If an LLM review is required and the configured revie
 - Loads the reviewer system prompt from Markdown for easy rule customization.
 - Automatically permits a small set of low-risk local coordination and introspection tools without an LLM request.
 - Reviews external filesystem access, source mutations, network operations, and remote-service tools with the configured model.
+- Applies task-scoped policy to secrets, data transmission, downloaded code, destructive changes, persistence, network exposure, remote mutations, and subagent delegation.
 - Caches decisions for the same tool call.
 
 ## Requirements
@@ -51,7 +52,7 @@ OpenCode loads configuration only at startup. Restart OpenCode after installing 
 Clone the repository to a stable location:
 
 ```bash
-git clone <repository-url> ~/projects/opencode-auto-mode
+git clone https://github.com/nuxlic-sh/opencode-auto-mode.git ~/projects/opencode-auto-mode
 ```
 
 Register the package in the global OpenCode configuration at `~/.config/opencode/opencode.json`:
@@ -64,7 +65,7 @@ Register the package in the global OpenCode configuration at `~/.config/opencode
       "file:///home/your-user/projects/opencode-auto-mode",
       {
         "enabled": true,
-        "model": "openai/gpt-5.6-luna",
+        "model": "provider/model-id",
         "timeoutMs": 60000
       }
     ]
@@ -89,7 +90,7 @@ Add the same plugin tuple to the project's `opencode.json`. Project configuratio
       "file:///absolute/path/to/opencode-auto-mode",
       {
         "enabled": true,
-        "model": "openai/gpt-5.6-luna"
+        "model": "provider/model-id"
       }
     ]
   ],
@@ -113,7 +114,7 @@ After the package is published to npm, add its package name to the plugin list:
       "opencode-auto-mode",
       {
         "enabled": true,
-        "model": "openai/gpt-5.6-luna"
+        "model": "provider/model-id"
       }
     ]
   ],
@@ -140,7 +141,7 @@ The plugin accepts these options in the second element of the plugin tuple:
 ```json
 {
   "enabled": false,
-  "model": "openai/gpt-5.6-luna"
+  "model": "provider/model-id"
 }
 ```
 
@@ -159,7 +160,7 @@ Example:
 ```json
 {
   "enabled": true,
-  "model": "openai/gpt-5.6-luna"
+  "model": "provider/model-id"
 }
 ```
 
@@ -179,7 +180,7 @@ If `model` is omitted, the plugin tries these sources in order:
 ```json
 {
   "enabled": true,
-  "model": "openai/gpt-5.6-luna",
+  "model": "provider/model-id",
   "timeoutMs": 90000
 }
 ```
@@ -229,7 +230,7 @@ The following conditions block tool invocations that need LLM review:
 - The provider request fails.
 - Review exceeds `timeoutMs`.
 - Reviewer returns anything other than `ALLOW: reason` or `BLOCK: reason`.
-- Reviewer session creation or cleanup fails before a valid decision is produced.
+- Reviewer session creation fails before a valid decision is produced.
 
 The plugin logs the failure, shows an OpenCode error toast when a TUI is attached, and throws before tool execution. It never falls back to an unreviewed automatic allow.
 
@@ -306,10 +307,11 @@ Restart OpenCode first. The plugin changes resolved `ask` actions to `allow` and
 
 ## Development
 
-Install development dependencies and run the type checker:
+Install development dependencies, run the tests, and run the type checker:
 
 ```bash
 npm install
+npm test
 npm run typecheck
 ```
 
@@ -324,7 +326,7 @@ The package exports `./server`, which is the entrypoint used by current OpenCode
 ## Security Notes
 
 - This plugin reduces permission fatigue; it is not an operating-system sandbox.
-- Every tool call is intercepted, but only conservative local read-only operations bypass LLM review.
+- Every tool call is intercepted, but only conservative local commands and low-risk coordination or introspection tools bypass LLM review.
 - Static rules are intentionally conservative, but shell syntax is complex and platform-specific.
 - LLM decisions are probabilistic. Keep hard security invariants in static block rules.
 - Do not use OpenCode's `--auto` flag as a replacement for this plugin's review policy.
