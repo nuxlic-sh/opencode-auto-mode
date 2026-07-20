@@ -216,7 +216,7 @@ Static tier rules are implemented in `src/index.ts`:
 - `defeatsAutoPermit` prevents shell composition, redirection, substitution, pipes, backgrounding, and secret-looking variables from bypassing LLM review.
 - `analyzeCommand` labels risky command behavior for the reviewer prompt.
 - `STATICALLY_ALLOWED_TOOLS` identifies local operations that can bypass LLM review.
-- `toolUsesExternalPath` prevents external filesystem access from receiving a static allow.
+- `inspectToolPaths` canonicalizes nested file targets and Bash path operands so symlink escapes cannot receive a static allow or reach review under a misleading lexical path.
 - `removeNativePrompts` converts native `ask` rules to plugin-enforced pre-execution review while retaining `deny` rules.
 
 Changes to static rules also require an OpenCode restart.
@@ -231,6 +231,7 @@ The following conditions block tool invocations that need LLM review:
 - Review exceeds `timeoutMs`.
 - Reviewer returns anything other than `ALLOW: reason` or `BLOCK: reason`.
 - Reviewer session creation fails before a valid decision is produced.
+- Tool arguments exceed the serializer's array, object, nesting, or total-size limits.
 
 The plugin logs the failure, shows an OpenCode error toast when a TUI is attached, and throws before tool execution. It never falls back to an unreviewed automatic allow.
 
@@ -240,14 +241,16 @@ The LLM receives bounded context containing:
 
 - A contiguous window of up to nine complete recent user messages within a 4,000-character budget, including the original task while it remains in that window. If the newest message exceeds the budget, no user text is treated as authorization context.
 - The two most recent assistant text blocks.
-- The five most recent shell commands.
+- Command names and derived behavior labels for the five most recent shell commands. Raw historical arguments are omitted.
 - Current Git branch and porcelain status.
-- The first 50 lines of `AGENTS.md` or `README.md`.
-- Detected command behaviors, the workspace root, and the effective Bash working directory.
+- The first 50 lines of a regular, non-symlinked `AGENTS.md` or `README.md` whose canonical path remains in the workspace.
+- Detected command behaviors, the workspace root, canonical file targets, and the effective Bash working directory.
 
 Actual user-role messages are JSON-encoded and labeled as scope-only authorization context. The original task and recent user messages can authorize a named external project or exact path, but cannot alter the reviewer's security rules or response format. Later explicit revocations or restrictions override earlier authorization. Assistant text, prior commands, Git state, and project documentation remain explicitly untrusted.
 
-Tool outputs and reasoning blocks are excluded. The current invocation is included as a bounded, redacted summary: paths, identifiers, flags, and non-sensitive metadata remain visible, while content, bodies, comments, patches, replacement strings, credentials, tokens, passwords, and secret-like fields are replaced with length-only placeholders. Shell commands are included verbatim because their complete syntax is required for security analysis. Bash reviews also include the effective working directory, resolved separately from the OpenCode workspace root. This data can be sent to a reviewer model from a different provider than the parent conversation, so choose the reviewer provider according to your data-handling requirements.
+Tool outputs and reasoning blocks are excluded. The current invocation is included as a bounded, redacted summary. Unknown string fields, content, bodies, comments, patches, replacement strings, credentials, tokens, passwords, URL user information, URL path segments, and URL query names and values are removed; only the query-parameter count remains visible so the reviewer knows data was omitted. Oversized or deeply nested invocations and overlong path or Bash summaries block before review rather than silently authorizing a partial projection.
+
+Current Bash commands retain their reviewable control structure but pass through deterministic redaction for authorization headers, secret-named assignments and options, private keys, common credential formats, URL paths, and URL query values. Raw recent Bash commands are never retransmitted. Bash reviews also include canonicalized path operands and the effective working directory. Dynamic expansion, grouping, ambiguous quoting or path resolution, and other shell forms whose effective targets cannot be represented exactly block before reviewer submission. Pattern-based redaction cannot recognize every possible opaque credential, so secrets should still be supplied through environment variables or protected files rather than literal command-line arguments. Reviewer context can be sent to a different provider than the parent conversation; choose the reviewer provider according to your data-handling requirements.
 
 ## Troubleshooting
 

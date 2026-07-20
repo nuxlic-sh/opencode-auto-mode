@@ -1,5 +1,5 @@
-import { readFile, realpath, stat } from "node:fs/promises"
-import { basename, isAbsolute, join, relative, resolve } from "node:path"
+import { lstat, readFile, realpath, stat } from "node:fs/promises"
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 
 import type { Plugin } from "@opencode-ai/plugin"
 
@@ -60,6 +60,17 @@ type Analysis = {
   hardBlockReason?: string
 }
 
+type PathInspection = {
+  external: boolean
+  ambiguous: boolean
+  targets: Array<{ input: string; canonical: string }>
+}
+
+type SerializedInvocation = {
+  text: string
+  incomplete: boolean
+}
+
 type Decision = {
   allowed: boolean
   reason: string
@@ -110,6 +121,20 @@ const AUTO_BLOCKED: Array<{ pattern: RegExp; reason: string }> = [
 ]
 
 const SECRET_ENV_VAR = /\$(?:\{(?:[A-Z0-9_]*(?:SECRET|TOKEN|KEY|CREDENTIAL|PASSWORD|PASSWD|PRIVATE|DSN)|AWS_[A-Z0-9_]*|DATABASE_URL|GH_TOKEN|GITHUB_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY)\}|(?:[A-Z0-9_]*(?:SECRET|TOKEN|KEY|CREDENTIAL|PASSWORD|PASSWD|PRIVATE|DSN)|AWS_[A-Z0-9_]*|DATABASE_URL|GH_TOKEN|GITHUB_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY)\b)/i
+const SECRET_ASSIGNMENT_NAME = String.raw`(?:(?:SECRET|TOKEN|KEY|CREDENTIAL|PASSWORD|PASSWD|PRIVATE|DSN)|[A-Za-z_][A-Za-z0-9_]*(?:SECRET|TOKEN|KEY|CREDENTIAL|PASSWORD|PASSWD|PRIVATE|DSN)[A-Za-z0-9_]*|AWS_[A-Za-z0-9_]+|DATABASE_URL)`
+const SECRET_OPTION_NAME = String.raw`(?:[A-Za-z0-9_-]*(?:secret|token|key|credential|password|passwd|private|dsn)[A-Za-z0-9_-]*)`
+const PATH_KEYS = new Set(["path", "filePath", "workdir", "cwd", "directory"])
+const FILESYSTEM_TOOLS = new Set(["apply_patch", "bash", "edit", "glob", "grep", "list", "lsp", "read", "write"])
+const PATH_OPTION = /^--?(?:config|directory|file|git-dir|input|output|path|root|work-tree|workdir)$/i
+const VISIBLE_STRING_KEYS = new Set([
+  ...PATH_KEYS,
+  "issueIdOrKey",
+  "method",
+  "permission",
+  "projectKey",
+  "tool",
+  "type",
+])
 
 function stripControl(value: string): string {
   return value
@@ -121,6 +146,36 @@ function stripControl(value: string): string {
 function truncate(value: string, max: number): string {
   if (value.length <= max) return value
   return value.slice(0, max) + "\n[...truncated...]"
+}
+
+function redactSecrets(value: string): string {
+  return value
+    .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]*PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
+    .replace(/(\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)([^\s'";]+)/gi, "$1[REDACTED]")
+    .replace(/(\b(?:X-API-Key|Api-Key)\s*:\s*)([^\s'";]+)/gi, "$1[REDACTED]")
+    .replace(new RegExp(`(\\b${SECRET_ASSIGNMENT_NAME}\\b\\s*[:=]\\s*)(["'])(.*?)\\2`, "gi"), "$1[REDACTED]")
+    .replace(new RegExp(`(\\b${SECRET_ASSIGNMENT_NAME}\\b\\s*[:=]\\s*)([^\\s"';&|]+)`, "gi"), "$1[REDACTED]")
+    .replace(new RegExp(`((?:--?)${SECRET_OPTION_NAME}(?:=|\\s+))(["'])(.*?)\\2`, "gi"), "$1[REDACTED]")
+    .replace(new RegExp(`((?:--?)${SECRET_OPTION_NAME}(?:=|\\s+))([^\\s"';&|]+)`, "gi"), "$1[REDACTED]")
+    .replace(/\b(?:gh[opusr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|sk-[A-Za-z0-9_-]{20,})\b/g, "[REDACTED]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED JWT]")
+}
+
+function redactUrl(value: string): string {
+  try {
+    const url = new URL(value)
+    const parameterCount = [...url.searchParams].length
+    const query = parameterCount ? `?[${parameterCount} query parameter${parameterCount === 1 ? "" : "s"} redacted]` : ""
+    const pathSegments = url.pathname.split("/").filter(Boolean)
+    const path = pathSegments.length ? `/[${pathSegments.length} redacted path segment${pathSegments.length === 1 ? "" : "s"}]` : ""
+    return `${url.protocol}//${url.host}${path}${query}${url.hash ? "#[redacted]" : ""}`
+  } catch {
+    return `[redacted ${value.length} character URI]`
+  }
+}
+
+function redactShellCommand(value: string): string {
+  return redactSecrets(value).replace(/https?:\/\/[^\s'"`;&|<>()]+/gi, (url) => redactUrl(url))
 }
 
 function errorMessage(error: unknown): string {
@@ -177,85 +232,257 @@ function removeNativePrompts(permission: PermissionAction | PermissionRules | un
   return result
 }
 
-function toolUsesExternalPath(tool: string, args: Record<string, unknown>, directory: string): boolean {
-  const keys = tool === "read" ? ["filePath"] : ["path", "filePath", "workdir", "cwd"]
-  for (const key of keys) {
-    const value = args[key]
-    if (typeof value !== "string" || !value.trim()) continue
-    if (value.startsWith("~") || value.startsWith("file://")) return true
-    const target = resolve(directory, value)
-    const local = relative(directory, target)
-    if (local === ".." || local.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(local)) {
-      return true
+function isOutsideWorkspace(workspace: string, target: string): boolean {
+  const local = relative(workspace, target)
+  return local === ".." || local.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(local)
+}
+
+async function canonicalizeTarget(input: string, directory: string, canonicalWorkspace: string) {
+  if (input.startsWith("~") || input.startsWith("file://")) {
+    return { input, canonical: "[external path syntax]", external: true, ambiguous: false }
+  }
+
+  const requested = resolve(directory, input)
+  let info
+  try {
+    info = await lstat(requested)
+  } catch {
+    info = null
+  }
+  if (info?.isSymbolicLink()) {
+    try {
+      const canonical = await realpath(requested)
+      return { input, canonical, external: isOutsideWorkspace(canonicalWorkspace, canonical), ambiguous: false }
+    } catch {
+      return { input, canonical: requested, external: false, ambiguous: true }
     }
   }
-  return false
+  if (info) {
+    try {
+      const canonical = await realpath(requested)
+      return { input, canonical, external: isOutsideWorkspace(canonicalWorkspace, canonical), ambiguous: false }
+    } catch {
+      return { input, canonical: requested, external: false, ambiguous: true }
+    }
+  }
+
+  try {
+    let parent = dirname(requested)
+    while (true) {
+      try {
+        const canonicalParent = await realpath(parent)
+        const canonical = resolve(canonicalParent, relative(parent, requested))
+        return { input, canonical, external: isOutsideWorkspace(canonicalWorkspace, canonical), ambiguous: false }
+      } catch {
+        const next = dirname(parent)
+        if (next === parent) break
+        parent = next
+      }
+    }
+  } catch {
+    // Fall through to a fail-closed ambiguous result.
+  }
+  return { input, canonical: requested, external: isOutsideWorkspace(canonicalWorkspace, requested), ambiguous: true }
+}
+
+function collectPathValues(tool: string, args: Record<string, unknown>): string[] {
+  if (!FILESYSTEM_TOOLS.has(tool)) return []
+  const paths: string[] = []
+  const visit = (value: unknown, key = "", depth = 0) => {
+    if (depth > 10) return
+    if (typeof value === "string") {
+      if (PATH_KEYS.has(key) && value.trim()) paths.push(value.trim())
+      return
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, key, depth + 1)
+      return
+    }
+    if (value && typeof value === "object") {
+      for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
+        visit(childValue, childKey, depth + 1)
+      }
+    }
+  }
+  visit(args)
+  if (tool === "apply_patch" && typeof args.patchText === "string") {
+    paths.push(...extractPatchPaths(args.patchText).paths)
+  }
+  return [...new Set(paths.filter(Boolean))]
+}
+
+function extractPatchPaths(patchText: string): { paths: string[]; incomplete: boolean } {
+  const paths: string[] = []
+  let incomplete = false
+  for (const line of patchText.split("\n")) {
+    if (!line.startsWith("*** ")) continue
+    const file = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/)?.[1]
+    const destination = line.match(/^\*\*\* Move to: (.+)$/)?.[1]
+    if (file || destination) {
+      paths.push(file ?? destination ?? "")
+    } else if (/(?:File:|Move to:)/i.test(line)) {
+      incomplete = true
+    }
+  }
+  return { paths: [...new Set(paths.filter(Boolean))], incomplete }
+}
+
+async function inspectToolPaths(
+  tool: string,
+  args: Record<string, unknown>,
+  directory: string,
+  canonicalWorkspace: string,
+): Promise<PathInspection> {
+  const pathValues = collectPathValues(tool, args)
+  let ambiguousShellSyntax = false
+  if (tool === "bash" && typeof args.command === "string") {
+    const shellWords = shellPathWords(args.command)
+    const tokens = shellWords.words
+    ambiguousShellSyntax = shellWords.ambiguous
+    const considerPath = async (candidate: string) => {
+      const value = candidate.replace(/^(['"])(.*)\1$/, "$2")
+      if (!value || /^(?:https?:|\$|\||&&|;|&)/.test(value)) return
+      if (value.includes("/") || value.startsWith(".") || value.startsWith("~")) {
+        pathValues.push(value)
+        return
+      }
+      try {
+        await lstat(resolve(directory, value))
+        pathValues.push(value)
+      } catch {
+        // Non-path shell operands do not need canonicalization.
+      }
+    }
+    for (let index = 0; index < tokens.length; index++) {
+      const token = tokens[index] ?? ""
+      const assignmentValue = token.match(/^[A-Za-z_][A-Za-z0-9_]*=(.*)$/)?.[1]
+      if (assignmentValue !== undefined) {
+        await considerPath(assignmentValue)
+        continue
+      }
+      const attachedRedirection = token.match(/^(?:\d*|&)(?:>>|>\||>|<>|<)(.+)$/)?.[1]
+      if (attachedRedirection) {
+        await considerPath(attachedRedirection)
+        continue
+      }
+      const optionSeparator = token.indexOf("=")
+      if (token.startsWith("-") && optionSeparator > 0) {
+        await considerPath(token.slice(optionSeparator + 1))
+        continue
+      }
+      const attachedPathOption = token.match(/^-[A-Za-z](.+)$/)?.[1]
+      if (attachedPathOption) {
+        await considerPath(attachedPathOption)
+        continue
+      }
+      if (PATH_OPTION.test(token)) {
+        await considerPath(tokens[index + 1] ?? "")
+        index += 1
+        continue
+      }
+      if (!token.startsWith("-")) await considerPath(token)
+    }
+  }
+  const targets = await Promise.all(
+    [...new Set(pathValues)].map((value) => canonicalizeTarget(value, directory, canonicalWorkspace)),
+  )
+  return {
+    external: targets.some((target) => target.external),
+    ambiguous: ambiguousShellSyntax || targets.some((target) => target.ambiguous),
+    targets: targets.map(({ input, canonical }) => ({ input, canonical })),
+  }
+}
+
+function serializedPathTargets(pathInspection: PathInspection) {
+  const incomplete =
+    pathInspection.targets.length > 100 ||
+    pathInspection.targets.some(({ input, canonical }) => input.length > 500 || canonical.length > 500)
+  const targets = pathInspection.targets.slice(0, 100).map(({ input, canonical }) => ({
+    input: input.startsWith("file://") ? redactUrl(input) : truncate(redactSecrets(input), 500),
+    canonical: truncate(redactSecrets(canonical), 500),
+  }))
+  return { targets, incomplete }
+}
+
+function serializedInvocation(text: string, incomplete = false): SerializedInvocation {
+  return { text, incomplete: incomplete || text.length > 12_000 }
 }
 
 function serializeToolInvocation(
   tool: string,
   args: Record<string, unknown>,
   directory: string,
+  pathInspection: PathInspection,
   effectiveCwd?: string,
-): string {
+): SerializedInvocation {
+  const pathProjection = serializedPathTargets(pathInspection)
   if (tool === "bash" && typeof args.command === "string") {
     const workdir = typeof args.workdir === "string" && args.workdir.trim() ? args.workdir.trim() : directory
-    return `bash ${JSON.stringify({ command: args.command.trim(), effectiveCwd: effectiveCwd ?? resolve(directory, workdir) })}`
+    const resolvedCwd = effectiveCwd ?? resolve(directory, workdir)
+    const text = `bash ${JSON.stringify({
+        command: redactShellCommand(args.command.trim()),
+        effectiveCwd: truncate(redactSecrets(resolvedCwd), 500),
+        canonicalPaths: pathProjection.targets,
+      })}`
+    return serializedInvocation(
+      text,
+      args.command.length > 8_000 || resolvedCwd.length > 500 || pathInspection.ambiguous || pathProjection.incomplete,
+    )
   }
 
   if (tool === "task") {
-    return `task ${JSON.stringify({
-      description: typeof args.description === "string" ? truncate(args.description, 200) : "[missing]",
-      subagentType: typeof args.subagent_type === "string" ? truncate(args.subagent_type, 100) : "[missing]",
-      prompt: typeof args.prompt === "string" ? `[redacted ${args.prompt.length} characters]` : "[missing]",
-    })}`
+    const description = typeof args.description === "string" ? args.description : ""
+    const subagentType = typeof args.subagent_type === "string" ? args.subagent_type : ""
+    return serializedInvocation(
+      `task ${JSON.stringify({
+        description: description ? truncate(redactSecrets(description), 200) : "[missing]",
+        subagentType: subagentType ? truncate(redactSecrets(subagentType), 100) : "[missing]",
+        prompt: typeof args.prompt === "string" ? `[redacted ${args.prompt.length} characters]` : "[missing]",
+      })}`,
+      description.length > 200 || subagentType.length > 100 || typeof args.prompt === "string",
+    )
   }
 
   if (tool === "apply_patch" && typeof args.patchText === "string") {
-    const files = Array.from(
-      args.patchText.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm),
-      (match) => match[1],
+    const patchPaths = extractPatchPaths(args.patchText)
+    return serializedInvocation(
+      `${tool} ${JSON.stringify({
+        files: patchPaths.paths.map(redactSecrets),
+        canonicalPaths: pathProjection.targets,
+        patchText: `[redacted ${args.patchText.length} characters]`,
+      })}`,
+      patchPaths.incomplete || pathProjection.incomplete,
     )
-    return `${tool} ${JSON.stringify({ files, patchText: `[redacted ${args.patchText.length} characters]` })}`
   }
 
+  let incomplete = false
   const redact = (value: unknown, key = "", depth = 0): unknown => {
-    if (depth > 4) return "[nested value omitted]"
+    if (depth > 4) {
+      incomplete = true
+      return "[nested value omitted; invocation must be blocked]"
+    }
     if (typeof value === "string") {
-      const safeKeys = new Set([
-        "cwd",
-        "directory",
-        "filePath",
-        "id",
-        "issueIdOrKey",
-        "method",
-        "name",
-        "path",
-        "permission",
-        "projectKey",
-        "server",
-        "tool",
-        "type",
-        "workdir",
-      ])
       if (key === "url" || key === "uri") {
-        try {
-          const url = new URL(value)
-          return `${url.protocol}//${url.host}${url.pathname}`
-        } catch {
-          return `[redacted ${value.length} character URI]`
-        }
+        return redactUrl(value)
       }
-      if (safeKeys.has(key)) return truncate(value, 500)
+      if (PATH_KEYS.has(key) && !FILESYSTEM_TOOLS.has(tool)) return `[redacted ${value.length} character path]`
+      if (VISIBLE_STRING_KEYS.has(key)) return truncate(redactSecrets(value), 500)
       return `[redacted ${value.length} characters]`
     }
-    if (Array.isArray(value)) return value.slice(0, 20).map((item) => redact(item, key, depth + 1))
+    if (Array.isArray(value)) {
+      if (value.length > 20) incomplete = true
+      const items = value.slice(0, 20).map((item) => redact(item, key, depth + 1))
+      if (value.length > 20) items.push(`[${value.length - 20} array items omitted; invocation must be blocked]`)
+      return items
+    }
     if (value && typeof value === "object") {
-      return Object.fromEntries(
-        Object.entries(value as Record<string, unknown>)
-          .slice(0, 30)
-          .map(([childKey, childValue]) => [childKey, redact(childValue, childKey, depth + 1)]),
+      const entries = Object.entries(value as Record<string, unknown>)
+      if (entries.length > 30) incomplete = true
+      const redacted = Object.fromEntries(
+        entries.slice(0, 30).map(([childKey, childValue]) => [childKey, redact(childValue, childKey, depth + 1)]),
       )
+      if (entries.length > 30) redacted["[omitted entries]"] = `${entries.length - 30}; invocation must be blocked`
+      return redacted
     }
     return value
   }
@@ -265,14 +492,18 @@ function serializeToolInvocation(
     encoded = JSON.stringify(redact(args))
   } catch {
     encoded = "[arguments could not be serialized]"
+    incomplete = true
   }
-  return `${tool} ${truncate(encoded, 8_000)}`
+  if (encoded.length > 8_000) incomplete = true
+  return serializedInvocation(
+    `${tool} ${truncate(encoded, 8_000)} canonicalPaths=${JSON.stringify(pathProjection.targets)}`,
+    incomplete || pathProjection.incomplete,
+  )
 }
 
-function analyzeTool(tool: string, args: Record<string, unknown>, directory: string): Analysis {
+function analyzeTool(tool: string, args: Record<string, unknown>): Analysis {
   if (tool === "bash") return analyzeCommand(typeof args.command === "string" ? args.command : "")
   const behaviors = [`tool-call: invokes the ${tool} tool`]
-  if (toolUsesExternalPath(tool, args, directory)) behaviors.push("external-path: accesses a path outside the project")
   if (/(edit|write|patch|create|update|delete|remove|transition|comment|worklog|link)/i.test(tool)) {
     behaviors.push("mutation: the tool name indicates a state-changing operation")
   }
@@ -282,19 +513,19 @@ function analyzeTool(tool: string, args: Record<string, unknown>, directory: str
 function staticToolDecision(
   tool: string,
   args: Record<string, unknown>,
-  directory: string,
   analysis: Analysis,
+  pathInspection: PathInspection,
 ): Decision | null {
   if (tool === "bash") {
     const command = typeof args.command === "string" ? args.command.trim() : ""
     const staticResult = staticDecision(command, "bash", analysis)
     if (staticResult?.allowed === false) return staticResult
     if (typeof args.workdir === "string" && args.workdir.trim()) return null
-    if (toolUsesExternalPath(tool, args, directory)) return null
+    if (pathInspection.external || pathInspection.ambiguous) return null
     return staticResult
   }
   if (!STATICALLY_ALLOWED_TOOLS.has(tool)) return null
-  if (toolUsesExternalPath(tool, args, directory)) return null
+  if (pathInspection.external || pathInspection.ambiguous) return null
   if (tool === "read") {
     const filePath = typeof args.filePath === "string" ? args.filePath : ""
     const name = basename(filePath)
@@ -331,7 +562,9 @@ function extractRecentCommands(messages: MessageWithParts[], currentCallID?: str
       const trimmed = raw.trim()
       if (!trimmed || seen.has(trimmed)) continue
       seen.add(trimmed)
-      commands.push(truncate(stripControl(trimmed), 500))
+      const commandName = trimmed.match(/^([A-Za-z0-9._+-]+)/)?.[1] ?? "unknown"
+      const behaviors = analyzeCommand(trimmed).behaviors
+      commands.push(`${commandName}: ${behaviors.length ? behaviors.join(", ") : "details omitted"}`)
     }
   }
   return commands
@@ -400,12 +633,17 @@ async function getGitContext(
 }
 
 async function getProjectDoc(directory: string): Promise<string | null> {
+  const canonicalWorkspace = await realpath(directory).catch(() => resolve(directory))
   for (const name of ["AGENTS.md", "README.md"]) {
     const path = join(directory, name)
     try {
-      const info = await stat(path)
+      const linkInfo = await lstat(path)
+      if (linkInfo.isSymbolicLink()) continue
+      const canonical = await realpath(path)
+      if (isOutsideWorkspace(canonicalWorkspace, canonical)) continue
+      const info = await stat(canonical)
       if (!info.isFile() || info.size > 100 * 1_024) continue
-      const content = await readFile(path, "utf8")
+      const content = await readFile(canonical, "utf8")
       return truncate(stripControl(content.split("\n").slice(0, 50).join("\n")), 4_096)
     } catch {
       continue
@@ -462,6 +700,68 @@ function roughTokenize(command: string): string[] {
   return tokens
 }
 
+function shellPathWords(command: string): { words: string[]; ambiguous: boolean } {
+  const words: string[] = []
+  let current = ""
+  let quote: "'" | '"' | null = null
+  let ambiguous = false
+  const flush = () => {
+    if (current) words.push(current)
+    current = ""
+  }
+
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index] ?? ""
+    if (quote) {
+      if (character === quote) {
+        quote = null
+      } else if (character === "\\" && quote === '"') {
+        const escaped = command[index + 1]
+        if (escaped === undefined) {
+          ambiguous = true
+        } else if (["$", "`", '"', "\\"].includes(escaped)) {
+          current += escaped
+          index += 1
+        } else if (escaped === "\n") {
+          index += 1
+        } else {
+          ambiguous = true
+          current += `\\${escaped}`
+          index += 1
+        }
+      } else {
+        if (quote === '"' && (character === "$" || character === "`")) ambiguous = true
+        current += character
+      }
+      continue
+    }
+    if (character === "'" || character === '"') {
+      quote = character
+      continue
+    }
+    if (character === "\\") {
+      const escaped = command[index + 1]
+      if (escaped === undefined) {
+        ambiguous = true
+      } else {
+        current += escaped
+        index += 1
+      }
+      continue
+    }
+    if (character === "$" || character === "`" || character === "(" || character === ")") {
+      ambiguous = true
+    }
+    if (/\s/.test(character) || character === ";" || character === "|" || character === "&") {
+      flush()
+      continue
+    }
+    current += character
+  }
+  flush()
+  return { words, ambiguous: ambiguous || quote !== null }
+}
+
 function gitArguments(tokens: string[]): { subcommand: string; args: string[] } | null {
   const gitIndex = tokens.findIndex((token) => token === "git")
   if (gitIndex === -1) return null
@@ -477,6 +777,12 @@ function gitArguments(tokens: string[]): { subcommand: string; args: string[] } 
 }
 
 function analyzeCommand(command: string): Analysis {
+  if (redactShellCommand(command) !== command && /`|\$\(|[<>]\(/.test(command)) {
+    return { behaviors: [], hardBlockReason: "redacted secret value contains executable shell substitution" }
+  }
+  if (/[`$()]/.test(command)) {
+    return { behaviors: [], hardBlockReason: "dynamic shell expansion or grouping cannot be safely reviewed" }
+  }
   for (const blocked of AUTO_BLOCKED) {
     if (blocked.pattern.test(command)) return { behaviors: [], hardBlockReason: blocked.reason }
   }
@@ -569,7 +875,7 @@ function formatContext(context: ReviewContext): string {
     untrustedSections.push(`[recent assistant plan text]\n${context.recentAssistant.join("\n---\n")}`)
   }
   if (context.recentCommands.length) {
-    untrustedSections.push(`[recent shell commands, newest first]\n${context.recentCommands.join("\n")}`)
+    untrustedSections.push(`[recent shell command summaries, newest first; arguments omitted]\n${context.recentCommands.join("\n")}`)
   }
   if (context.branch !== null || context.gitStatus !== null) {
     untrustedSections.push(
@@ -787,7 +1093,16 @@ export default (async ({ client, directory, $ }, options) => {
     if (typeof command !== "string" || !command.trim()) return
 
     try {
-      const decision = await decide(command.trim(), request.permission, request.sessionID, request.tool?.callID)
+      const rawCommand = command.trim()
+      const analysis = analyzeCommand(rawCommand)
+      const decision = await decide(
+        redactShellCommand(rawCommand),
+        request.permission,
+        request.sessionID,
+        request.tool?.callID,
+        analysis,
+        staticDecision(rawCommand, request.permission, analysis),
+      )
       const reply = await client.postSessionIdPermissionsPermissionId({
         path: { id: request.sessionID, permissionID: request.id },
         body: { response: decision.allowed ? "once" : "reject" },
@@ -825,6 +1140,7 @@ export default (async ({ client, directory, $ }, options) => {
       config.permission = removeNativePrompts(config.permission as PermissionAction | PermissionRules | undefined)
 
       for (const agent of Object.values(config.agent ?? {})) {
+        if (!agent) continue
         const permission = agent.permission
         if (!permission) continue
         agent.permission = removeNativePrompts(permission as PermissionAction | PermissionRules)
@@ -840,7 +1156,7 @@ export default (async ({ client, directory, $ }, options) => {
           mode: "subagent",
           hidden: true,
           steps: 1,
-          permission: { "*": "deny" },
+          permission: { "*": "deny" } as never,
           prompt: reviewerPrompt,
           ...(configuredModelSpec ? { model: configuredModelSpec } : {}),
         },
@@ -848,18 +1164,22 @@ export default (async ({ client, directory, $ }, options) => {
     },
     "tool.execute.before": async (input, output) => {
       const args = output.args && typeof output.args === "object" ? (output.args as Record<string, unknown>) : {}
-      const analysis = analyzeTool(input.tool, args, directory)
-      const staticResult = staticToolDecision(input.tool, args, directory, analysis)
+      const analysis = analyzeTool(input.tool, args)
+      const pathInspection = await inspectToolPaths(input.tool, args, directory, canonicalWorkspace)
+      if (pathInspection.external) analysis.behaviors.push("external-path: canonical target is outside the project")
+      if (pathInspection.ambiguous) analysis.behaviors.push("ambiguous-path: canonical target could not be verified")
+      const staticResult = staticToolDecision(input.tool, args, analysis, pathInspection)
       let effectiveCwd: string | undefined
       if (!staticResult && input.tool === "bash") {
         const workdir = typeof args.workdir === "string" && args.workdir.trim() ? args.workdir.trim() : directory
         const requestedCwd = resolve(directory, workdir)
         effectiveCwd = await realpath(requestedCwd).catch(() => requestedCwd)
       }
-      const operation =
-        staticResult?.allowed === false && input.tool === "bash" && typeof args.command === "string"
-          ? args.command.trim()
-          : serializeToolInvocation(input.tool, args, directory, effectiveCwd)
+      const serialized = serializeToolInvocation(input.tool, args, directory, pathInspection, effectiveCwd)
+      if (serialized.incomplete && !staticResult) {
+        throw new Error(`Auto-reviewer cannot safely review incomplete ${input.tool} arguments; operation blocked`)
+      }
+      const operation = serialized.text
       if (effectiveCwd) {
         const local = relative(canonicalWorkspace, effectiveCwd)
         if (local === ".." || local.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(local)) {
@@ -895,7 +1215,16 @@ export default (async ({ client, directory, $ }, options) => {
       const command = input.metadata.command
       if (typeof command !== "string" || !command.trim()) return
       try {
-        const decision = await decide(command.trim(), input.type, input.sessionID, input.callID)
+        const rawCommand = command.trim()
+        const analysis = analyzeCommand(rawCommand)
+        const decision = await decide(
+          redactShellCommand(rawCommand),
+          input.type,
+          input.sessionID,
+          input.callID,
+          analysis,
+          staticDecision(rawCommand, input.type, analysis),
+        )
         output.status = decision.allowed ? "allow" : "deny"
         await reportDecision(decision)
       } catch (error) {
