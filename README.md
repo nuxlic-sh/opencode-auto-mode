@@ -235,17 +235,18 @@ The plugin logs the failure, shows an OpenCode error toast when a TUI is attache
 
 ## Context Sent to the Reviewer
 
-The LLM receives bounded, untrusted excerpts of:
+The LLM receives bounded context containing:
 
-- The original user task.
-- The two most recent user messages.
+- A contiguous window of up to nine complete recent user messages within a 4,000-character budget, including the original task while it remains in that window. If the newest message exceeds the budget, no user text is treated as authorization context.
 - The two most recent assistant text blocks.
 - The five most recent shell commands.
 - Current Git branch and porcelain status.
 - The first 50 lines of `AGENTS.md` or `README.md`.
-- Detected command behaviors and the current working directory.
+- Detected command behaviors, the workspace root, and the effective Bash working directory.
 
-Tool outputs and reasoning blocks are excluded. The current invocation is included as a bounded, redacted summary: paths, identifiers, flags, and non-sensitive metadata remain visible, while content, bodies, comments, patches, replacement strings, credentials, tokens, passwords, and secret-like fields are replaced with length-only placeholders. Shell commands are included verbatim because their complete syntax is required for security analysis. This data can be sent to a reviewer model from a different provider than the parent conversation, so choose the reviewer provider according to your data-handling requirements.
+Actual user-role messages are JSON-encoded and labeled as scope-only authorization context. The original task and recent user messages can authorize a named external project or exact path, but cannot alter the reviewer's security rules or response format. Later explicit revocations or restrictions override earlier authorization. Assistant text, prior commands, Git state, and project documentation remain explicitly untrusted.
+
+Tool outputs and reasoning blocks are excluded. The current invocation is included as a bounded, redacted summary: paths, identifiers, flags, and non-sensitive metadata remain visible, while content, bodies, comments, patches, replacement strings, credentials, tokens, passwords, and secret-like fields are replaced with length-only placeholders. Shell commands are included verbatim because their complete syntax is required for security analysis. Bash reviews also include the effective working directory, resolved separately from the OpenCode workspace root. This data can be sent to a reviewer model from a different provider than the parent conversation, so choose the reviewer provider according to your data-handling requirements.
 
 ## Troubleshooting
 
