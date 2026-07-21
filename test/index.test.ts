@@ -8,13 +8,16 @@ import autoMode from "../src/index.ts"
 type MockState = {
   promptCalls: number
   reviewerRequests: string[]
+  permissionResponses: string[]
 }
 
-function makeShell() {
+function makeShell(outputs: string[] = []) {
   return (() => {
+    const hasOutput = outputs.length > 0
+    const output = outputs.shift() ?? ""
     const promise = Promise.resolve({
-      exitCode: 1,
-      text: () => "",
+      exitCode: hasOutput ? 0 : 1,
+      text: () => output,
     }) as Promise<{ exitCode: number; text(): string }> & {
       cwd(path: string): unknown
       quiet(): unknown
@@ -32,8 +35,10 @@ async function makeHooks(
   userMessages: string[] = [],
   directory = "/workspace/project",
   priorCommands: string[] = [],
+  assistantMessages: string[] = [],
+  gitOutputs: string[] = [],
 ) {
-  const state: MockState = { promptCalls: 0, reviewerRequests: [] }
+  const state: MockState = { promptCalls: 0, reviewerRequests: [], permissionResponses: [] }
   const client = {
     app: {
       log: async () => ({ data: true }),
@@ -46,6 +51,10 @@ async function makeHooks(
         data: [
           ...userMessages.map((text, index) => ({
             info: { id: `user-${index}`, role: "user" },
+            parts: [{ type: "text", text }],
+          })),
+          ...assistantMessages.map((text, index) => ({
+            info: { id: `assistant-text-${index}`, role: "assistant" },
             parts: [{ type: "text", text }],
           })),
           ...priorCommands.map((command, index) => ({
@@ -74,7 +83,10 @@ async function makeHooks(
       abort: async () => ({ data: true }),
       delete: async () => ({ data: true }),
     },
-    postSessionIdPermissionsPermissionId: async () => ({ data: true }),
+    postSessionIdPermissionsPermissionId: async (request: { body?: { response?: string } }) => {
+      state.permissionResponses.push(request.body?.response ?? "")
+      return { data: true }
+    },
   }
   const hooks = await autoMode(
     {
@@ -83,7 +95,7 @@ async function makeHooks(
       worktree: directory,
       project: { id: "project" },
       serverUrl: new URL("http://localhost:4096"),
-      $: makeShell(),
+      $: makeShell(gitOutputs),
     } as never,
     { enabled: true, model: "openai/test-model" },
   )
@@ -434,17 +446,116 @@ describe("pre-execution review", () => {
     expect(state.reviewerRequests[0]).not.toContain("TOP_SECRET_SENTINEL")
   })
 
-  test("redacts secrets embedded in URLs before review", async () => {
+  test("preserves exact generic tool arguments for authorization", async () => {
     const { hooks, state } = await makeHooks()
 
-    await executeBefore(hooks, "webfetch", {
-      url: "https://example.test/path?token=TOP_SECRET_SENTINEL",
-      description: "TOP_SECRET_SENTINEL",
-    })
+    await executeBefore(hooks, "custom_remote_tool", { channel: "C1", message: "HELLO" })
+    await executeBefore(hooks, "custom_remote_tool", { channel: "C2", message: "WORLD" })
 
-    expect(state.promptCalls).toBe(1)
-    expect(state.reviewerRequests[0]).toContain("https://example.test/[1 redacted path segment]?[1 query parameter redacted]")
-    expect(state.reviewerRequests[0]).not.toContain("TOP_SECRET_SENTINEL")
+    expect(state.promptCalls).toBe(2)
+    expect(state.reviewerRequests[0]).not.toBe(state.reviewerRequests[1])
+    expect(state.reviewerRequests[0]).toContain('\\"channel\\":\\"C1\\"')
+    expect(state.reviewerRequests[0]).toContain('\\"message\\":\\"HELLO\\"')
+    expect(state.reviewerRequests[1]).toContain('\\"channel\\":\\"C2\\"')
+    expect(state.reviewerRequests[1]).toContain('\\"message\\":\\"WORLD\\"')
+  })
+
+  test("preserves exact URL resources for authorization", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "webfetch", { url: "https://example.test/allowed?a=one", description: "read" })
+    await executeBefore(hooks, "webfetch", { url: "https://example.test/private?b=two", description: "read" })
+
+    expect(state.promptCalls).toBe(2)
+    expect(state.reviewerRequests[0]).not.toBe(state.reviewerRequests[1])
+    expect(state.reviewerRequests[0]).toContain("https://example.test/allowed?a=one")
+    expect(state.reviewerRequests[1]).toContain("https://example.test/private?b=two")
+  })
+
+  test.each([
+    ["webfetch", { url: "https://example.test/path?q=%20" }, { url: "https://example.test/path?q=+" }],
+    ["bash", { command: "curl https://example.test/path?q=%20" }, { command: "curl https://example.test/path?q=+" }],
+  ])("preserves raw URL encoding for %s authorization", async (tool, firstArgs, secondArgs) => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, tool, firstArgs)
+    await executeBefore(hooks, tool, secondArgs)
+
+    expect(state.promptCalls).toBe(2)
+    expect(state.reviewerRequests[0]).not.toBe(state.reviewerRequests[1])
+    expect(state.reviewerRequests[0]).toContain("https://example.test/path?q=%20")
+    expect(state.reviewerRequests[1]).toContain("https://example.test/path?q=+")
+  })
+
+  test.each(["user", "assistant"])("redacts secrets from %s conversation context", async (role) => {
+    const marker = "SYNTHETIC_CONTEXT_SECRET_123456789"
+    const message = `OPENAI_API_KEY=${marker}`
+    const urlPassword = "&SYNTHETIC_URL_PASSWORD_123456789;()"
+    const url = `https://alice:${urlPassword}@example.test/repository`
+    const userMessages = role === "user" ? [`${message} ${url}`] : []
+    const assistantMessages = role === "assistant" ? [`${message} ${url}`] : []
+    const { hooks, state } = await makeHooks("ALLOW: safe fixture operation", userMessages, "/workspace/project", [], assistantMessages)
+
+    await executeBefore(hooks, "list_mcp_resources", { server: "remote" })
+
+    expect(state.reviewerRequests[0]).not.toContain(marker)
+    expect(state.reviewerRequests[0]).not.toContain(urlPassword)
+    expect(state.reviewerRequests[0]).toContain("https://example.test/repository")
+    expect(state.reviewerRequests[0]).toContain("OPENAI_API_KEY=[REDACTED]")
+  })
+
+  test.each(["AGENTS.md", "README.md"])("redacts secrets from %s project context", async (name) => {
+    const project = await mkdtemp(join(tmpdir(), "auto-mode-project-context-"))
+    const marker = "SYNTHETIC_PROJECT_SECRET_123456789"
+    const urlPassword = "&SYNTHETIC_PROJECT_URL_PASSWORD_123456789;()"
+    await writeFile(
+      join(project, name),
+      `OPENAI_API_KEY=${marker}\nhttps://alice:${urlPassword}@example.test/repository`,
+    )
+
+    try {
+      const { hooks, state } = await makeHooks("ALLOW: safe fixture operation", [], project)
+
+      await executeBefore(hooks, "list_mcp_resources", { server: "remote" })
+
+      expect(state.reviewerRequests[0]).not.toContain(marker)
+      expect(state.reviewerRequests[0]).not.toContain(urlPassword)
+      expect(state.reviewerRequests[0]).toContain("https://example.test/repository")
+      expect(state.reviewerRequests[0]).toContain("OPENAI_API_KEY=[REDACTED]")
+    } finally {
+      await rm(project, { recursive: true, force: true })
+    }
+  })
+
+  test("redacts URL credentials from Git context", async () => {
+    const urlPassword = "&SYNTHETIC_GIT_URL_PASSWORD_123456789;()"
+    const status = ` M https://alice:${urlPassword}@example.test/repository`
+    const { hooks, state } = await makeHooks(
+      "ALLOW: safe fixture operation",
+      [],
+      "/workspace/project",
+      [],
+      [],
+      ["main", status],
+    )
+
+    await executeBefore(hooks, "list_mcp_resources", { server: "remote" })
+
+    expect(state.reviewerRequests[0]).not.toContain(urlPassword)
+    expect(state.reviewerRequests[0]).toContain("https://example.test/repository")
+  })
+
+  test("blocks URLs whose resource identity contains redacted secrets", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await expect(
+      executeBefore(hooks, "webfetch", {
+        url: "https://example.test/path?token=TOP_SECRET_SENTINEL",
+        description: "safe test request",
+      }),
+    ).rejects.toThrow("cannot safely review incomplete webfetch arguments")
+
+    expect(state.promptCalls).toBe(0)
   })
 
   test("redacts literal credentials from current Bash commands", async () => {
@@ -455,10 +566,9 @@ describe("pre-execution review", () => {
       executeBefore(hooks, "bash", {
         command: `curl -H 'Authorization: Bearer ${marker}' https://example.test/api`,
       }),
-    ).rejects.toThrow("Auto-reviewer blocked bash")
+    ).rejects.toThrow("cannot safely review incomplete bash arguments")
 
-    expect(state.reviewerRequests[0]).toContain("Authorization: Bearer [REDACTED]")
-    expect(state.reviewerRequests[0]).not.toContain(marker)
+    expect(state.promptCalls).toBe(0)
   })
 
   test.each([";", "&&", "||", "|"])("preserves shell operator %s after a redacted URL", async (operator) => {
@@ -467,7 +577,7 @@ describe("pre-execution review", () => {
     await executeBefore(hooks, "bash", { command: `curl https://example.test/path${operator}git push` })
 
     const encodedOperator = operator.replaceAll("&", "\\u0026")
-    expect(state.reviewerRequests[0]).toContain(`[1 redacted path segment]${encodedOperator}git push`)
+    expect(state.reviewerRequests[0]).toContain(`https://example.test/path${encodedOperator}git push`)
   })
 
   test.each([
@@ -477,11 +587,11 @@ describe("pre-execution review", () => {
   ])("redacts prefixed secret assignment: %s", async (command) => {
     const { hooks, state } = await makeHooks()
 
-    await executeBefore(hooks, "bash", { command })
+    await expect(executeBefore(hooks, "bash", { command })).rejects.toThrow(
+      "cannot safely review incomplete bash arguments",
+    )
 
-    expect(state.reviewerRequests[0]).not.toContain("SYNTHETIC_PREFIXED_SECRET_123456789")
-    expect(state.reviewerRequests[0]).not.toContain("SYNTHETIC PREFIXED SECRET 123456789")
-    expect(state.reviewerRequests[0]).toContain("[REDACTED]")
+    expect(state.promptCalls).toBe(0)
   })
 
   test.each([
@@ -517,14 +627,15 @@ describe("pre-execution review", () => {
     expect(state.promptCalls).toBe(0)
   })
 
-  test("redacts opaque URL query names", async () => {
+  test("blocks opaque secret-looking URL query names", async () => {
     const marker = "OPAQUE_QUERY_NAME_SECRET_123456789"
     const { hooks, state } = await makeHooks()
 
-    await executeBefore(hooks, "webfetch", { url: `https://example.test/path?${marker}=x` })
+    await expect(executeBefore(hooks, "webfetch", { url: `https://example.test/path?${marker}=x` })).rejects.toThrow(
+      "cannot safely review incomplete webfetch arguments",
+    )
 
-    expect(state.reviewerRequests[0]).not.toContain(marker)
-    expect(state.reviewerRequests[0]).toContain("[1 query parameter redacted]")
+    expect(state.promptCalls).toBe(0)
   })
 
   test("blocks oversized Bash operations before model review", async () => {
@@ -564,15 +675,78 @@ describe("pre-execution review", () => {
     expect(state.promptCalls).toBe(0)
   })
 
-  test("redacts schema-agnostic identifier and name values", async () => {
+  test("blocks secret-looking schema-agnostic values", async () => {
     const marker = "SYNTHETIC_SAFE_KEY_SECRET_123456789"
     const { hooks, state } = await makeHooks()
 
-    await executeBefore(hooks, "custom_remote_tool", { id: marker, name: marker, path: marker, server: marker })
+    await expect(
+      executeBefore(hooks, "custom_remote_tool", { id: marker, name: marker, path: marker, server: marker }),
+    ).rejects.toThrow("cannot safely review incomplete custom_remote_tool arguments")
 
-    expect(state.reviewerRequests[0]).not.toContain(marker)
-    expect(state.reviewerRequests[0]).toContain(`[redacted ${marker.length} characters]`)
-    expect(state.reviewerRequests[0]).toContain(`[redacted ${marker.length} character path]`)
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test.each(["token", "password", "apiKey"])("blocks opaque values in secret-named %s fields", async (key) => {
+    const marker = "opaque-value-123456789"
+    const { hooks, state } = await makeHooks()
+
+    await expect(executeBefore(hooks, "custom_remote_tool", { [key]: marker })).rejects.toThrow(
+      "cannot safely review incomplete custom_remote_tool arguments",
+    )
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test.each([
+    ["password", 123456],
+    ["token", ["opaque", 123]],
+    ["credentials", { value: "opaque-value" }],
+  ])("blocks structured values in secret-named %s fields", async (key, value) => {
+    const { hooks, state } = await makeHooks()
+
+    await expect(executeBefore(hooks, "custom_remote_tool", { [key]: value })).rejects.toThrow(
+      "cannot safely review incomplete custom_remote_tool arguments",
+    )
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("fails closed for incomplete permission.ask commands", async () => {
+    const { hooks, state } = await makeHooks()
+    const output = { status: "ask" }
+
+    await hooks["permission.ask"]?.(
+      {
+        type: "bash",
+        sessionID: "session",
+        callID: "call",
+        metadata: { command: "curl -H 'Authorization: Bearer opaque-value' https://example.test" },
+      } as never,
+      output as never,
+    )
+
+    expect(output.status).toBe("deny")
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("fails closed for incomplete permission events", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await hooks.event?.({
+      event: {
+        type: "permission.asked",
+        properties: {
+          id: "permission",
+          sessionID: "session",
+          permission: "bash",
+          metadata: { command: "curl https://alice:opaque-value@example.test" },
+          tool: { messageID: "message", callID: "call" },
+        },
+      },
+    } as never)
+
+    expect(state.permissionResponses).toEqual(["reject"])
+    expect(state.promptCalls).toBe(0)
   })
 
   test("redacts secrets from canonical path annotations", async () => {
@@ -588,10 +762,11 @@ describe("pre-execution review", () => {
     try {
       const { hooks, state } = await makeHooks("ALLOW: fixture path review", [], project)
 
-      await executeBefore(hooks, "read", { filePath: join(project, "link", "target.txt") })
+      await expect(executeBefore(hooks, "read", { filePath: join(project, "link", "target.txt") })).rejects.toThrow(
+        "cannot safely review incomplete read arguments",
+      )
 
-      expect(state.reviewerRequests[0]).not.toContain(marker)
-      expect(state.reviewerRequests[0]).toContain("token=[REDACTED]")
+      expect(state.promptCalls).toBe(0)
     } finally {
       await rm(base, { recursive: true, force: true })
     }
@@ -785,10 +960,11 @@ describe("pre-execution review", () => {
     try {
       const { hooks, state } = await makeHooks("ALLOW: fixture workdir review", [], project)
 
-      await executeBefore(hooks, "bash", { command: "date", workdir })
+      await expect(executeBefore(hooks, "bash", { command: "date", workdir })).rejects.toThrow(
+        "cannot safely review incomplete bash arguments",
+      )
 
-      expect(state.reviewerRequests[0]).not.toContain(marker)
-      expect(state.reviewerRequests[0]).toContain("token=[REDACTED]")
+      expect(state.promptCalls).toBe(0)
     } finally {
       await rm(base, { recursive: true, force: true })
     }
