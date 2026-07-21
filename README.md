@@ -16,7 +16,7 @@ For operations that require LLM classification, the plugin is fail-closed. If no
 - Keeps the reviewer agent tool-free so untrusted review context cannot cause tool execution.
 - Supports an explicit reviewer model, configurable timeout, and enable/disable flag.
 - Loads the reviewer system prompt from Markdown for easy rule customization.
-- Automatically permits a small set of low-risk local coordination and introspection tools without an LLM request.
+- Automatically permits a small set of low-risk local tools, including well-formed patches confined to the project, without an LLM request.
 - Reviews external filesystem access, source mutations, network operations, and remote-service tools with the configured model.
 - Applies task-scoped policy to secrets, data transmission, downloaded code, destructive changes, persistence, network exposure, remote mutations, and subagent delegation.
 - Caches decisions for the same tool call.
@@ -33,13 +33,13 @@ Every tool invocation goes through three tiers:
 
 | Tier | Result | Examples |
 | --- | --- | --- |
-| Static allow | Runs immediately | local `lsp`, `skill`, `todowrite`, `question`, `ls`, `git status --short`, `date` |
+| Static allow | Runs immediately | local `apply_patch`, `lsp`, `skill`, `todowrite`, `question`, `ls`, `git status --short`, `gh pr view` metadata reads, `date` |
 | Static block | Never executes | `sudo`, `rm -rf /`, `chmod 777`, `mkfs`, `shutdown` |
 | LLM review | Reviewer returns `ALLOW` or `BLOCK` | external reads, edits, network calls, remote mutations, installs, force-push, recursive deletion |
 
 The `tool.execute.before` hook performs the review before any tool executes. Native permission prompts are disabled while the plugin is enabled. If an operation is blocked, the hook throws an error and the tool is never started.
 
-Only selected low-risk local operations are statically allowed. Filesystem tools such as `read`, `glob`, and `grep`, external paths, `.env` files, state-changing tools, unknown tools, and remote operations are sent to the reviewer with bounded context.
+Only selected low-risk local operations are statically allowed. A well-formed `apply_patch` bypasses model review when all canonical target paths stay inside the project. Other filesystem tools such as `read`, `glob`, and `grep`, external paths, `.env` files, unknown tools, and remote operations are sent to the reviewer with bounded context.
 
 The recommended base configuration keeps `"permission": {"*": "ask"}` outside the plugin tuple. The plugin converts that fallback to automatic pre-execution review when it loads. If the plugin is disabled or fails to load, OpenCode retains native permission prompts instead of silently allowing tools.
 
@@ -212,10 +212,11 @@ The plugin fails to load if the prompt file is missing or empty. Restart OpenCod
 Static tier rules are implemented in `src/index.ts`:
 
 - `AUTO_PERMITTED` controls commands that bypass the LLM.
+- `AUTO_PERMITTED_COMPOUND` controls narrowly defined read-only command chains that bypass the LLM.
 - `AUTO_BLOCKED` controls commands that are always rejected.
 - `defeatsAutoPermit` prevents shell composition, redirection, substitution, pipes, backgrounding, and secret-looking variables from bypassing LLM review.
 - `analyzeCommand` labels risky command behavior for the reviewer prompt.
-- `STATICALLY_ALLOWED_TOOLS` identifies local operations that can bypass LLM review.
+- `STATICALLY_ALLOWED_TOOLS` identifies local operations that can bypass LLM review, including well-formed `apply_patch` calls confined to the project.
 - `inspectToolPaths` canonicalizes nested file targets and Bash path operands so symlink escapes cannot receive a static allow or reach review under a misleading lexical path.
 - `removeNativePrompts` converts native `ask` rules to plugin-enforced pre-execution review while retaining `deny` rules.
 
@@ -250,7 +251,7 @@ Actual user-role messages are JSON-encoded and labeled as scope-only authorizati
 
 Tool outputs and reasoning blocks are excluded. The current invocation is included as a bounded, redacted summary. Unknown string fields, content, bodies, comments, patches, replacement strings, credentials, tokens, passwords, URL user information, URL path segments, and URL query names and values are removed; only the query-parameter count remains visible so the reviewer knows data was omitted. Oversized or deeply nested invocations and overlong path or Bash summaries block before review rather than silently authorizing a partial projection.
 
-Current Bash commands retain their reviewable control structure but pass through deterministic redaction for authorization headers, secret-named assignments and options, private keys, common credential formats, URL paths, and URL query values. Raw recent Bash commands are never retransmitted. Bash reviews also include canonicalized path operands and the effective working directory. Dynamic expansion, grouping, ambiguous quoting or path resolution, and other shell forms whose effective targets cannot be represented exactly block before reviewer submission. Pattern-based redaction cannot recognize every possible opaque credential, so secrets should still be supplied through environment variables or protected files rather than literal command-line arguments. Reviewer context can be sent to a different provider than the parent conversation; choose the reviewer provider according to your data-handling requirements.
+Current Bash commands retain their reviewable control structure but pass through deterministic redaction for authorization headers, secret-named assignments and options, private keys, common credential formats, URL paths, and URL query values. External or ambiguous `apply_patch` calls include their patch text so the reviewer can inspect the exact change; detected secrets and oversized patches still fail closed. Raw recent Bash commands are never retransmitted. Bash reviews also include canonicalized path operands and the effective working directory. Dynamic expansion, grouping, ambiguous quoting or path resolution, and other shell forms whose effective targets cannot be represented exactly block before reviewer submission. Pattern-based redaction cannot recognize every possible opaque credential, so secrets should still be supplied through environment variables or protected files rather than literal command-line arguments. Reviewer context can be sent to a different provider than the parent conversation; choose the reviewer provider according to your data-handling requirements.
 
 ## Troubleshooting
 

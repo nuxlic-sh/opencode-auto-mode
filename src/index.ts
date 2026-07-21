@@ -86,6 +86,7 @@ type PermissionAction = "ask" | "allow" | "deny"
 type PermissionRules = Record<string, PermissionAction | Record<string, PermissionAction>>
 
 const STATICALLY_ALLOWED_TOOLS = new Set([
+  "apply_patch",
   "lsp",
   "skill",
   "todowrite",
@@ -107,6 +108,10 @@ const AUTO_PERMITTED = [
   /^(uname|id)(?:\s+-[A-Za-z]+)?\s*$/i,
   /^date(?:\s+\+\S+)?\s*$/i,
   /^(python3?|node|uv|tsx|npx)\s+(--version|-v|--help|-h)$/i,
+]
+
+const AUTO_PERMITTED_COMPOUND = [
+  /^(?:source|\.)\s+(?:\.\/)?\.venv\/bin\/activate\s*&&\s*gh\s+pr\s+view(?:\s+\d+)?\s+--json\s+[A-Za-z][A-Za-z0-9]*(?:,[A-Za-z][A-Za-z0-9]*)*\s*$/i,
 ]
 
 const AUTO_BLOCKED: Array<{ pattern: RegExp; reason: string }> = [
@@ -351,7 +356,9 @@ function extractPatchPaths(patchText: string): { paths: string[]; incomplete: bo
     const file = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/)?.[1]
     const destination = line.match(/^\*\*\* Move to: (.+)$/)?.[1]
     if (file || destination) {
-      paths.push(file ?? destination ?? "")
+      const path = (file ?? destination ?? "").trim()
+      if (path) paths.push(path)
+      else incomplete = true
     } else if (/(?:File:|Move to:)/i.test(line)) {
       incomplete = true
     }
@@ -488,13 +495,17 @@ function serializeToolInvocation(
 
   if (tool === "apply_patch" && typeof args.patchText === "string") {
     const patchPaths = extractPatchPaths(args.patchText)
+    const redactedPatch = redactSecrets(args.patchText)
     return serializedInvocation(
       `${tool} ${JSON.stringify({
         files: patchPaths.paths.map(redactSecrets),
         canonicalPaths: pathProjection.targets,
-        patchText: `[redacted ${args.patchText.length} characters]`,
+        patchText: truncate(redactedPatch, 8_000),
       })}`,
-      patchPaths.incomplete || pathProjection.incomplete,
+      patchPaths.incomplete ||
+        pathProjection.incomplete ||
+        redactedPatch !== args.patchText ||
+        args.patchText.length > 8_000,
     )
   }
 
@@ -583,6 +594,20 @@ function staticToolDecision(
   }
   if (!STATICALLY_ALLOWED_TOOLS.has(tool)) return null
   if (pathInspection.external || pathInspection.ambiguous) return null
+  if (tool === "apply_patch") {
+    const patchText = typeof args.patchText === "string" ? args.patchText : ""
+    const patchPaths = extractPatchPaths(patchText)
+    if (
+      !patchText ||
+      patchText.length > 8_000 ||
+      patchPaths.incomplete ||
+      patchPaths.paths.length === 0 ||
+      patchPaths.paths.length > 100 ||
+      patchPaths.paths.some((path) => path.length > 500)
+    ) {
+      return null
+    }
+  }
   if (tool === "read") {
     const filePath = typeof args.filePath === "string" ? args.filePath : ""
     const name = basename(filePath)
@@ -910,7 +935,11 @@ function staticDecision(command: string, permission: string, analysis: Analysis)
   if (analysis.hardBlockReason) {
     return { allowed: false, reason: analysis.hardBlockReason, source: "static-block" }
   }
-  if (permission !== "bash" || analysis.behaviors.length > 0 || defeatsAutoPermit(command)) return null
+  if (permission !== "bash" || analysis.behaviors.length > 0) return null
+  if (AUTO_PERMITTED_COMPOUND.some((pattern) => pattern.test(command))) {
+    return { allowed: true, reason: "conservative read-only command", source: "static-allow" }
+  }
+  if (defeatsAutoPermit(command)) return null
   if (AUTO_PERMITTED.some((pattern) => pattern.test(command))) {
     return { allowed: true, reason: "conservative read-only command", source: "static-allow" }
   }

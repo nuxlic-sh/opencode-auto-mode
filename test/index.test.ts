@@ -161,6 +161,30 @@ describe("pre-execution review", () => {
     expect(state.promptCalls).toBe(0)
   })
 
+  test("statically permits reading PR metadata after activating the local virtualenv", async () => {
+    const { hooks, state } = await makeHooks()
+
+    await executeBefore(hooks, "bash", {
+      command:
+        "source .venv/bin/activate && gh pr view 45099 --json title,body,baseRefName,headRefName,files,commits",
+    })
+
+    expect(state.promptCalls).toBe(0)
+  })
+
+  test("does not extend the PR metadata exception to appended commands", async () => {
+    const { hooks, state } = await makeHooks("BLOCK: appended command is outside the static exception")
+
+    await expect(
+      executeBefore(hooks, "bash", {
+        command:
+          "source .venv/bin/activate && gh pr view 45099 --json title,body,baseRefName,headRefName,files,commits && git push",
+      }),
+    ).rejects.toThrow("Auto-reviewer blocked bash")
+
+    expect(state.promptCalls).toBe(1)
+  })
+
   test("hard-blocks privilege escalation without calling the model", async () => {
     const { hooks, state } = await makeHooks()
 
@@ -998,6 +1022,75 @@ describe("pre-execution review", () => {
 
       expect(state.reviewerRequests[0]).toContain(join(external, "moved.txt"))
       expect(state.reviewerRequests[0]).toContain("canonical target is outside the project")
+    } finally {
+      await rm(base, { recursive: true, force: true })
+    }
+  })
+
+  test("statically permits a well-formed patch whose targets stay inside the project", async () => {
+    const project = await mkdtemp(join(tmpdir(), "auto-mode-local-patch-"))
+    await writeFile(join(project, "source.txt"), "before")
+
+    try {
+      const { hooks, state } = await makeHooks("BLOCK: reviewer must not be reached", [], project)
+
+      await executeBefore(hooks, "apply_patch", {
+        patchText: "*** Begin Patch\n*** Update File: source.txt\n@@\n-before\n+after\n*** End Patch",
+      })
+
+      expect(state.promptCalls).toBe(0)
+    } finally {
+      await rm(project, { recursive: true, force: true })
+    }
+  })
+
+  test("includes patch contents when an external target requires review", async () => {
+    const base = await mkdtemp(join(tmpdir(), "auto-mode-external-patch-content-"))
+    const project = join(base, "project")
+    const external = join(base, "external")
+    const marker = "EXTERNAL_PATCH_CONTENT_MARKER"
+    await mkdir(project)
+    await mkdir(external)
+    await symlink(external, join(project, "link"))
+
+    try {
+      const { hooks, state } = await makeHooks("ALLOW: external patch authorized for test", [], project)
+
+      await executeBefore(hooks, "apply_patch", {
+        patchText: `*** Begin Patch\n*** Add File: link/created.txt\n+${marker}\n*** End Patch`,
+      })
+
+      expect(state.promptCalls).toBe(1)
+      expect(state.reviewerRequests[0]).toContain(marker)
+    } finally {
+      await rm(base, { recursive: true, force: true })
+    }
+  })
+
+  test.each([
+    ["Add", "*** Add File:   link/created.txt\n+created"],
+    ["Update", "*** Update File:   link/target.txt\n@@\n-before\n+after"],
+    ["Delete", "*** Delete File:   link/target.txt"],
+    ["Move", "*** Update File: source.txt\n*** Move to:   link/moved.txt\n@@\n-before\n+after"],
+  ])("does not statically permit whitespace-padded external %s paths", async (_operation, directive) => {
+    const base = await mkdtemp(join(tmpdir(), "auto-mode-padded-external-patch-"))
+    const project = join(base, "project")
+    const external = join(base, "external")
+    await mkdir(project)
+    await mkdir(external)
+    await writeFile(join(project, "source.txt"), "before")
+    await writeFile(join(external, "target.txt"), "before")
+    await symlink(external, join(project, "link"))
+
+    try {
+      const { hooks, state } = await makeHooks("ALLOW: external patch authorized for test", [], project)
+
+      await executeBefore(hooks, "apply_patch", {
+        patchText: `*** Begin Patch\n${directive}\n*** End Patch`,
+      })
+
+      expect(state.promptCalls).toBe(1)
+      expect(state.reviewerRequests[0]).toContain(external)
     } finally {
       await rm(base, { recursive: true, force: true })
     }
